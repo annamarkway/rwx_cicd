@@ -13,6 +13,11 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall("/opt", filter="data")
 os.rename("/opt/sqlglot-${SQLGLOT_SHA}", "/opt/sqlglot")
 PY
 
+# The labeled environment's packages, so candidate tests run as they were labeled.
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock && rm /tmp/requirements.lock
+RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests || true
+
 COPY app /app
 RUN chmod -R a+rX /app /opt/sqlglot
 ENV PYTHONDONTWRITEBYTECODE=1 BR_SRC=/opt/sqlglot

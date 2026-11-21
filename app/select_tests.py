@@ -228,6 +228,42 @@ def _bound_names(stmt) -> set[str]:
     return names
 
 
+def _identity_safe(node) -> bool:
+    """Operands where `is` and `==` agree for every sqlglot type.
+
+    None (Expression.__eq__ and _Dialect.__eq__ return False for it) and
+    enum-style members like NormalizationStrategy.UPPERCASE / TokenType.SELECT
+    (Enum equality is identity).
+    """
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id[:1].isupper() and not node.value.id.isupper()
+            and node.attr.isupper() and len(node.attr) > 1):
+        return True
+    return False
+
+
+class _Normalize(ast.NodeTransformer):
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and (_identity_safe(node.left) or _identity_safe(node.comparators[0])):
+            op = node.ops[0]
+            if isinstance(op, ast.Eq):
+                node.ops = [ast.Is()]
+            elif isinstance(op, ast.NotEq):
+                node.ops = [ast.IsNot()]
+        return node
+
+
+def equivalent(old_tree: ast.AST, new_tree: ast.AST) -> bool:
+    import copy
+
+    a = _Normalize().visit(copy.deepcopy(old_tree))
+    b = _Normalize().visit(copy.deepcopy(new_tree))
+    return ast.dump(a) == ast.dump(b)
+
+
 # --------------------------------------------------------------------------- selector
 
 
@@ -398,6 +434,9 @@ class Selector:
             return self.import_breakers(path)
         if ast.dump(self.tree(path)) == ast.dump(new_tree):
             self.log.append(f"{path}: AST unchanged")
+            return set()
+        if equivalent(self.tree(path), new_tree):
+            self.log.append(f"{path}: equivalent (is/== on None or enum)")
             return set()
         sel: set[int] = set()
         for ln in sorted(set(changed_points(fd))):
