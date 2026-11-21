@@ -461,6 +461,9 @@ class Selector:
         if equivalent(self.tree(path), new_tree):
             self.log.append(f"{path}: equivalent (is/== on None or enum)")
             return set()
+        entry = self.table_entry_rule(path, fd)
+        if entry is not None:
+            return entry
         sel: set[int] = set()
         for ln in sorted(set(changed_points(fd))):
             if ln < 1:
@@ -470,6 +473,144 @@ class Selector:
                 return ALL
             sel |= r
         return sel
+
+    # --- lookup-table entries in tokenizer/parser/generator/dialect classes
+
+    TABLE_FILES = ("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/tokenizers/")
+    TABLE_CORE = ("sqlglot/tokens.py", "sqlglot/parser.py", "sqlglot/generator.py")
+
+    def table_entry_rule(self, path: str, fd: FileDiff) -> set[int] | None:
+        """A change confined to entries of class-level dict literals.
+
+        Tables like KEYWORDS, FUNCTIONS, TRANSFORMS or TIME_MAPPING are looked
+        up by SQL text or by expression class, so an entry only matters to the
+        class's users whose input mentions the entry's text (case-insensitive),
+        or that build the expression class it is keyed by. Returns None when
+        the rule does not apply (then the general rules run).
+        """
+        if not (path.startswith(self.TABLE_FILES) or path in self.TABLE_CORE):
+            return None
+        tree = self.tree(path)
+        points = sorted({ln for ln in changed_points(fd) if ln >= 1})
+        if not points:
+            return None
+        entries, users = [], set()
+        for ln in points:
+            chain = locate(tree, ln)
+            if not chain or any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in chain):
+                return None
+            if not any(isinstance(n, ast.ClassDef) for n in chain):
+                return None
+            inner = chain[-1]
+            value = getattr(inner, "value", None)
+            if not isinstance(inner, (ast.Assign, ast.AnnAssign)) or not isinstance(value, ast.Dict):
+                return None
+            hit = None
+            for k, v in zip(value.keys, value.values):
+                if k is None:
+                    continue  # **spread: its own line is never "inside" an entry
+                a, b = min(k.lineno, v.lineno), max(k.end_lineno, v.end_lineno)
+                if a <= ln <= b:
+                    hit = (k, v)
+                    break
+            if hit is None:
+                # Between entries (an inserted line): use its neighbours.
+                near = [(k, v) for k, v in zip(value.keys, value.values)
+                        if k is not None and (k.lineno in (ln, ln + 1) or v.end_lineno in (ln, ln - 1))]
+                if not near:
+                    return None
+                entries.extend(near)
+            else:
+                entries.append(hit)
+            u = self.class_users(path, chain)
+            if u is None:
+                return None
+            users |= u | self.cov_node(path, [n for n in chain if isinstance(n, ast.ClassDef)][0])
+        # The text and expression classes an entry is about: from the old
+        # entries and from the lines the patch adds.
+        needles, exp_classes = set(), set()
+        texts = [ast.get_source_segment(self.text(path), n) or "" for kv in entries for n in kv]
+        texts += [t for _s, body in fd.hunks for tag, t in body if tag == "+"]
+        for t in texts:
+            for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\'', t):
+                s = (m.group(1) if m.group(1) is not None else m.group(2)).lower()
+                if s:
+                    needles.add(s)
+                    needles.update(w for w in re.split(r"\s+", s) if len(w) >= 3)
+            exp_classes.update(re.findall(r"\bexp\.([A-Z]\w*)", t))
+        if not needles and not exp_classes:
+            return None
+        built = set()
+        for name in exp_classes:
+            for key, ts in self.classes.items():
+                if key.endswith(":" + name):
+                    built.update(ts)
+        out = {n for n in users if n in built or self.test_mentions(n, needles)}
+        self.log.append(f"{path}: table entry rule, {len(out)} of {len(users)} users")
+        return out
+
+    def test_mentions(self, number: int, needles: set[str]) -> bool:
+        if not needles:
+            return False
+        text = self.test_text(number)
+        return any(nd in text for nd in needles)
+
+    def test_text(self, number: int) -> str:
+        """Lowercased text a test feeds to sqlglot: its own source, the
+        non-test code of its file (helpers, shared constants), and the
+        fixture files it opens."""
+        cache = self.__dict__.setdefault("_ttext", {})
+        if number in cache:
+            return cache[number]
+        t = self.tests[number]
+        rel, parts = t["file"], t["id"].split("::")[1:]
+        src = self.text(rel) or ""
+        shared, own = self._file_parts(rel)
+        body = own.get(tuple(parts))
+        if body is None:
+            body = src.lower()  # cannot locate: the whole file
+        fix = self.__dict__.setdefault("_test_fixtures", None)
+        if fix is None:
+            fix = {}
+            for f, ts in self.opens.items():
+                for n in ts:
+                    fix.setdefault(n, []).append(f)
+            self._test_fixtures = fix
+        extra = []
+        for f in fix.get(number, ()):
+            ft = self.text(f)
+            if ft:
+                extra.append(ft.lower())
+        cache[number] = "\n".join([shared, body] + extra)
+        return cache[number]
+
+    def _file_parts(self, rel: str):
+        """(file text outside test methods, {(Class, test): method text})."""
+        cache = self.__dict__.setdefault("_fparts", {})
+        if rel in cache:
+            return cache[rel]
+        src = self.text(rel) or ""
+        lines = src.split("\n")
+        own, cut = {}, set()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            cache[rel] = (src.lower(), {})
+            return cache[rel]
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for m in node.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name.startswith("test"):
+                        a, b = _start(m), m.end_lineno
+                        own[(node.name, m.name)] = "\n".join(lines[a - 1:b]).lower()
+                        cut.update(range(a, b + 1))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                a, b = _start(node), node.end_lineno
+                own[(node.name,)] = "\n".join(lines[a - 1:b]).lower()
+                cut.update(range(a, b + 1))
+        shared = "\n".join(ln for i, ln in enumerate(lines, start=1) if i not in cut).lower()
+        cache[rel] = (shared, own)
+        return cache[rel]
 
     def import_breakers(self, path: str) -> set[int] | str:
         """A file that no longer compiles: every test that imports it fails."""
