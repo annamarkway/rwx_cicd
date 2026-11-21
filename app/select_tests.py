@@ -395,6 +395,9 @@ class Selector:
         classes = [n for n in chain if isinstance(n, ast.ClassDef)]
         if classes:
             users = self.class_users(rel, chain)
+            narrowed = self.class_attr_rule(rel, inner, users)
+            if narrowed is not None:
+                return narrowed
             # Coverage of the whole outermost class (its methods run when used).
             sel |= self.cov_node(rel, classes[0])
             if users is not None:
@@ -418,6 +421,59 @@ class Selector:
         if r == ALL:
             return ALL
         return sel | r
+
+    def class_attr_rule(self, rel: str, stmt, users) -> set[int] | None:
+        """A plain class attribute (WEEK_OFFSET = -1) in a dialect-side class.
+
+        Its value matters only where code reads it, and sqlglot reads class
+        attributes by name (.WEEK_OFFSET, getattr(x, "WEEK_OFFSET")); its only
+        generic attribute walks collect *_sql methods or copy objects. So the
+        affected tests are the class's users that execute a line naming it.
+        If any such line runs at import time (a class body, module level, a
+        metaclass __new__ / __init_subclass__), the value flows into derived
+        state and the rule does not narrow. Returns None when not applicable.
+        """
+        if users is None or not (rel.startswith(self.TABLE_FILES) or rel in self.TABLE_CORE):
+            return None
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            return None
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        if not all(isinstance(t, ast.Name) for t in targets):
+            return None
+        names = {t.id for t in targets}
+        pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
+        readers: set[int] = set()
+        for f in self.pyfiles():
+            t = self.text(f)
+            if not t or not pat.search(t):
+                continue
+            try:
+                tree = self.tree(f)
+            except SyntaxError:
+                return None
+            for i, ln in enumerate(t.split("\n"), start=1):
+                if not pat.search(ln):
+                    continue
+                if f == rel and _start(stmt) <= i <= (stmt.end_lineno or stmt.lineno):
+                    continue
+                code = ln.split("#", 1)[0]
+                if not pat.search(code):
+                    continue  # only in a comment
+                chain = locate(tree, i)
+                funcs = [n for n in chain if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                last = chain[-1] if chain else None
+                if not funcs and isinstance(last, (ast.Assign, ast.AnnAssign)) and any(
+                        isinstance(n, ast.ClassDef) for n in chain):
+                    tg = last.targets if isinstance(last, ast.Assign) else [last.target]
+                    value_names = {n.id for n in ast.walk(last.value) if isinstance(n, ast.Name)} if last.value is not None else set()
+                    if all(isinstance(x, ast.Name) and x.id in names for x in tg) and not (value_names & names):
+                        continue  # another class defining its own value: an override, not a read
+                if not funcs or any(fn.name in ("__new__", "__init_subclass__", "__set_name__") for fn in funcs):
+                    return None  # read at import time: effects spread
+                readers |= self.cov_node(f, chain[-1])
+        out = set(users) & readers
+        self.log.append(f"{rel}: class attribute {sorted(names)} read by {len(out)} of {len(users)} users")
+        return out
 
     def name_users(self, rel: str, names: set[str], depth: int, exclude=None) -> set[int] | str:
         """Tests that execute code referring to any of names."""
