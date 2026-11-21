@@ -346,3 +346,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Skip interpreter teardown: nothing left to do, and DuckDB's bindings
+    # otherwise print leak warnings for objects frozen before forking.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
