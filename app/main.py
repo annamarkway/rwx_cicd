@@ -199,6 +199,35 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     return [n for n in chosen if ids[n] not in passed]
 
 
+SMALL_SUM_MS = 3000  # fully run candidate sets up to this many recorded seconds
+
+
+def try_harmless(runner, patch_text, files, chosen, ms, ids, notes):
+    """Run a small, heavy-free candidate set in full; print nothing if all pass.
+
+    Stops at the first failure (then the static set is printed, so the
+    remaining results could not change the answer). Skipped for fixture-only
+    edits, which almost always break the test that reads them.
+    """
+    if not chosen or files and all(f.startswith("tests/fixtures/") for f in files):
+        return chosen
+    if max(ms[n] for n in chosen) > RUN_MAX_MS or sum(ms[n] for n in chosen) > SMALL_SUM_MS:
+        return chosen
+    order = sorted(chosen, key=lambda n: ms[n])
+    os.environ["BR_STOP_ON_FAIL"] = "1"
+    t = time.time()
+    try:
+        res = runner.run(patch_text, [ids[n] for n in order], timeout=30)
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"full run error {e!r}")
+        return chosen
+    finally:
+        os.environ.pop("BR_STOP_ON_FAIL", None)
+    ok = res is not None and all(res.get(ids[n]) in ("passed", "skipped") for n in chosen)
+    notes.append(f"full run of {len(chosen)} {'passed' if ok else 'failed'} in {time.time() - t:.1f}s")
+    return [] if ok else chosen
+
+
 def main():
     t0 = time.process_time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
@@ -231,6 +260,10 @@ def main():
             chosen = refine(runner, patch, chosen, ms, ids, sel.log)
         if qmap is not None and chosen and time.time() - wall0 < WALL_BUDGET:
             chosen = check_heavy(runner, qmap, sel, patch.read_text(errors="replace"), chosen, ids, ms, sel.log)
+        if HEAVY and chosen and len(chosen) < len(every) and time.time() - wall0 < WALL_BUDGET:
+            text = patch.read_text(errors="replace")
+            files = [ln[6:].strip() for ln in text.split("\n") if ln.startswith("+++ b/")]
+            chosen = try_harmless(runner, text, files, chosen, ms, ids, sel.log)
         workers = pack(chosen, ms)
         cost = (max(sum(ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost
