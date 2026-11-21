@@ -642,7 +642,43 @@ class Selector:
             # Only that test module breaks (unless others import from it).
             r = self.name_users(path, {os.path.basename(path)[:-3]}, 0)
             return ALL if r == ALL else (self.by_file[path] | r)
-        raise Fallback(f"syntax error in {path}")
+        self.log.append(f"{path}: does not compile, its importers")
+        return self.importers(path)
+
+    def importers(self, rel: str) -> set[int]:
+        """Every test that imports module rel (runs any of its lines).
+
+        A change to a module can only affect tests that import it, so this is
+        a safe superset for any change to it. From the isolated map: lines
+        run during a test, and lines run while importing a test file.
+        """
+        cache = self.__dict__.setdefault("_importers", {})
+        if rel not in cache:
+            out: set[int] = set()
+            for ts in self.lines.get(rel, {}).values():
+                out.update(ts)
+            for files in self.imports.get(rel, {}).values():
+                for f in files:
+                    out |= self.by_file.get(f, set())
+            out |= self.by_file.get(rel, set())
+            cache[rel] = out
+        return set(cache[rel])
+
+    def module_fallback(self, fd: FileDiff) -> set[int] | None:
+        """When the finer rules give up on a .py file: its importers."""
+        if fd.binary:
+            return None
+        paths = [p for p in (fd.old, fd.new) if p]
+        if not paths or not all(p.endswith(".py") for p in paths):
+            return None
+        if any(os.path.basename(p) in ("conftest.py", "sitecustomize.py", "usercustomize.py", "setup.py")
+               for p in paths):
+            return None
+        out: set[int] = set()
+        for p in paths:
+            if self.text(p) is not None:  # exists at the pinned commit
+                out |= self.importers(p)
+        return out
 
     def dir_openers(self, path: str) -> set[int]:
         d = os.path.dirname(path)
@@ -710,7 +746,13 @@ class Selector:
                 raise Fallback("empty patch")
             sel: set[int] = set()
             for fd in files:
-                r = self.for_file(fd)
+                try:
+                    r = self.for_file(fd)
+                except (Fallback, RecursionError) as e:
+                    r = self.module_fallback(fd)
+                    if r is None:
+                        raise
+                    self.log.append(f"{fd.new or fd.old}: {e}; using its {len(r)} importers")
                 if r == ALL:
                     return ALL
                 sel |= r
