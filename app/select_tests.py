@@ -444,6 +444,12 @@ class Selector:
         if old is None:
             raise Fallback(f"unknown file {path}")
         new = apply(old, fd)
+        if (path.startswith("sqlglot/") and path not in self.lines and path not in self.imports
+                and os.path.basename(path) != "__init__.py"):
+            # No test ever imports or runs this module (e.g. sqlglot/__main__.py,
+            # the CLI): nothing a test runs can change.
+            self.log.append(f"{path}: never executed by any test")
+            return set()
         try:
             new_tree = ast.parse(new)
             compile(new_tree, path, "exec")

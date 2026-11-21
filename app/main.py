@@ -12,7 +12,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from runner import Runner  # noqa: E402
+from runner import MAX_NODES_ID, Runner, proxy_max_nodes  # noqa: E402
 from select_tests import ALL, Selector  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -119,7 +119,7 @@ def cost_of(numbers, ms):
 def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     """Run cheap partial versions of the heavy tests in chosen; drop those that pass."""
     by_id = {ids[n]: n for n in chosen}
-    want = [i for i in by_id if i in TPCDS_IDS | TPCH_IDS | GEN_IDS]
+    want = [i for i in by_id if i in TPCDS_IDS | TPCH_IDS | GEN_IDS | {MAX_NODES_ID}]
     if not want:
         return chosen
     found = sel.changed_spans(patch_text)
@@ -128,6 +128,24 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     spans, others = found
     if any(not o.startswith("tests/fixtures/") for o in others):
         return chosen
+    if MAX_NODES_ID in want and not any(r.startswith("tests/") for r, *_ in spans):
+        base = cost_of(chosen, ms)
+        rest = [n for n in chosen if ids[n] != MAX_NODES_ID]
+        if 0.85 * (base - cost_of(rest, ms)) > 1.0:
+            t = time.time()
+            try:
+                res = runner.run_fn(patch_text, proxy_max_nodes, timeout=15)
+            except Exception as e:  # noqa: BLE001
+                res = None
+                notes.append(f"max_nodes check error {e!r}")
+            ok = res is not None and res.get(MAX_NODES_ID) == "passed"
+            notes.append(f"max_nodes check {'passed' if ok else 'failed'} in {time.time() - t:.1f}s")
+            if ok:
+                chosen = rest
+                by_id.pop(MAX_NODES_ID, None)
+        want = [i for i in want if i != MAX_NODES_ID]
+        if not want:
+            return chosen
     # Candidate checks: (spec key, spec value, test ids, estimated CPU seconds).
     groups = []
     if any(i in TPCDS_IDS for i in want):

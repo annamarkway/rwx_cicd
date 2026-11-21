@@ -101,14 +101,18 @@ class Runner:
 
     def run(self, patch_text: str, nodeids: list[str], timeout: float) -> dict[str, str] | None:
         """Return {nodeid: 'passed'|'failed'} for tests that reported, or None."""
+        return self.run_fn(patch_text, lambda: _child(nodeids), timeout)
+
+    def run_fn(self, patch_text: str, fn, timeout: float) -> dict[str, str] | None:
+        """Run fn() in a forked child against the patched tree; fn returns a dict."""
         self.prepare()
         undo = self._apply(patch_text)
         try:
-            return self._fork(nodeids, timeout)
+            return self._fork(fn, timeout)
         finally:
             self._restore(undo)
 
-    def _fork(self, nodeids, timeout):
+    def _fork(self, fn, timeout):
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # child
@@ -123,7 +127,7 @@ class Runner:
             global _EMIT
             _EMIT = emit
             try:
-                res = _child(nodeids)
+                res = fn()
                 os.write(w, json.dumps(res).encode())
             except BaseException as e:  # noqa: BLE001
                 try:
@@ -355,3 +359,51 @@ def _install_inline_executor():
 
     cf.ProcessPoolExecutor = InlineExecutor
     cfp.ProcessPoolExecutor = InlineExecutor
+
+
+MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+
+
+def proxy_max_nodes():
+    """test_max_nodes scaled down 100x: same code paths, well under a second.
+
+    The real test builds a 10000-column, 100-deep query (~2M nodes) and checks
+    the 1,000,000 and 50,000 node limits; parsing it takes ~29 s. Here the
+    query is 100 columns wide (~20k nodes) and the limits scale with it, so
+    every assertion keeps its meaning (over the limit by the same factor).
+    The test module is imported too, as pytest would, so a change that breaks
+    its imports fails here as it would there.
+    """
+    os.chdir(WORK)
+    sys.path.insert(0, str(WORK))
+    for m in list(sys.modules):
+        if m == "sqlglot" or m.startswith(("sqlglot.", "tests")):
+            del sys.modules[m]
+    sys.stdout = sys.stderr = open(os.devnull, "w")
+    ok = True
+    try:
+        import tests.test_parser  # noqa: F401
+        from sqlglot import exp, parse_one
+        from sqlglot.errors import ParseError
+
+        assert isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+        cols = [f"col{i}" for i in range(500)]
+        assert isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select)
+
+        width, depth = 100, 100
+        sql = "SELECT " + ",".join("x" + "=x" * depth for _ in range(width))
+        for limit, needle in ((10_000, "Maximum number of AST nodes"), (500, "(500)")):
+            try:
+                parse_one(sql, max_nodes=limit)
+                ok = False
+            except ParseError as e:
+                ok = ok and needle in str(e)
+        try:
+            parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+            ok = False
+        except ParseError:
+            pass
+        assert isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+    except BaseException:  # noqa: BLE001
+        ok = False
+    return {MAX_NODES_ID: "passed" if ok else "failed"}
