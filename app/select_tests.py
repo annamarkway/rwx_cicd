@@ -245,6 +245,25 @@ def _identity_safe(node) -> bool:
 
 
 class _Normalize(ast.NodeTransformer):
+    def __init__(self, strip_annotations=False):
+        self.strip = strip_annotations
+
+    def _fn(self, node):
+        self.generic_visit(node)
+        if self.strip:
+            # With `from __future__ import annotations` a function's argument
+            # and return annotations are never evaluated, and nothing in
+            # sqlglot introspects them (only class-level ones, for dataclasses
+            # and TypedDicts, which are left alone).
+            node.returns = None
+            a = node.args
+            for arg in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]:
+                if arg is not None:
+                    arg.annotation = None
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = _fn
+
     def visit_Compare(self, node):
         self.generic_visit(node)
         if len(node.ops) == 1 and (_identity_safe(node.left) or _identity_safe(node.comparators[0])):
@@ -259,8 +278,13 @@ class _Normalize(ast.NodeTransformer):
 def equivalent(old_tree: ast.AST, new_tree: ast.AST) -> bool:
     import copy
 
-    a = _Normalize().visit(copy.deepcopy(old_tree))
-    b = _Normalize().visit(copy.deepcopy(new_tree))
+    def future_annotations(tree):
+        return any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
+                   and any(a.name == "annotations" for a in n.names) for n in tree.body)
+
+    strip = future_annotations(old_tree) and future_annotations(new_tree)
+    a = _Normalize(strip).visit(copy.deepcopy(old_tree))
+    b = _Normalize(strip).visit(copy.deepcopy(new_tree))
     return ast.dump(a) == ast.dump(b)
 
 
@@ -459,7 +483,7 @@ class Selector:
             self.log.append(f"{path}: AST unchanged")
             return set()
         if equivalent(self.tree(path), new_tree):
-            self.log.append(f"{path}: equivalent (is/== on None or enum)")
+            self.log.append(f"{path}: equivalent (is/== on None or enum, or annotations only)")
             return set()
         entry = self.table_entry_rule(path, fd)
         if entry is not None:

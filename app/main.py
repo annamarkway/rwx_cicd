@@ -31,6 +31,9 @@ TPCDS_IDS = {"tests/test_executor.py::TestExecutor::test_execute_tpcds"}
 TPCH_IDS = {"tests/test_executor.py::TestExecutor::test_execute_tpch",
             "tests/test_executor.py::TestExecutor::test_optimized_tpch"}
 GEN_IDS = {"tests/test_generator.py::TestGenerator::test_generator_memory"}
+# Optimizer fixture tests (check_file): run only the cases of affected dialects.
+OPT_PREFIX = "tests/test_optimizer.py::TestOptimizer::"
+OPT_MIN_MS = 300
 DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/",
                 "sqlglot/tokenizers/", "sqlglot/typing/")
 
@@ -122,7 +125,8 @@ def cost_of(numbers, ms):
 def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     """Run cheap partial versions of the heavy tests in chosen; drop those that pass."""
     by_id = {ids[n]: n for n in chosen}
-    want = [i for i in by_id if i in TPCDS_IDS | TPCH_IDS | GEN_IDS | {MAX_NODES_ID}]
+    opt = [i for i in by_id if i.startswith(OPT_PREFIX) and ms[by_id[i]] >= OPT_MIN_MS]
+    want = [i for i in by_id if i in TPCDS_IDS | TPCH_IDS | GEN_IDS | {MAX_NODES_ID}] + opt
     if not want:
         return chosen
     found = sel.changed_spans(patch_text)
@@ -164,6 +168,10 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
             groups.append(("gen_modules", mods, [i for i in want if i in GEN_IDS], 0.6))
     # Run a check only when dropping its tests would save more than it costs
     # (allowing for the ~15% of checks that fail and save nothing).
+    if opt and not others:
+        mods = gen_modules(spans)
+        if mods is not None and not any(m.rsplit(".", 1)[-1] == "duckdb" for m in mods):
+            groups.append(("opt_modules", mods, opt, 1.2 + 0.3 * sum(ms[by_id[i]] for i in opt) / 1000))
     # Checks are judged together: dropping one heavy test rarely helps while
     # another heavy test still sets the busiest worker.
     base = cost_of(chosen, ms)

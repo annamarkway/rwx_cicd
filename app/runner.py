@@ -207,6 +207,8 @@ def _child(nodeids):
             # the executor tests must be restricted before that happens.
             if name == "TestExecutor" and isinstance(obj, type):
                 _restrict_executor(obj, json.loads(os.environ.get("BR_SUBSET") or "{}"))
+            if name == "TestOptimizer" and isinstance(obj, type):
+                _restrict_optimizer(obj, json.loads(os.environ.get("BR_SUBSET") or "{}"))
             return None
 
         def pytest_collection_finish(self, session):
@@ -299,6 +301,54 @@ def _restrict_executor(TE, spec):
                 setattr(cls, attr, [new[i] for i in sorted(idx) if i < len(new)])
 
         TE.setUpClass = classmethod(setUpClass)
+
+
+def _dialect_hit(name, mods):
+    """Does dialect `name` (or its parser/generator/tokenizer) live in mods?"""
+    try:
+        from sqlglot.dialects.dialect import Dialect
+
+        d = Dialect.get_or_raise(name)
+        hier = {k.__module__ for k in type(d).__mro__}
+        for attr in ("generator_class", "parser_class", "tokenizer_class"):
+            c = getattr(d, attr, None)
+            if c is not None:
+                hier |= {k.__module__ for k in c.__mro__}
+    except Exception:  # noqa: BLE001
+        return True  # cannot tell: keep the case
+    return bool(hier & mods)
+
+
+def _restrict_optimizer(TO, spec):
+    """check_file runs only fixture cases whose dialect the change reaches.
+
+    Cases with no dialect use the base dialect, which a change confined to
+    one dialect's own modules cannot reach.
+    """
+    mods = spec.get("opt_modules")
+    if mods is None or TO.__dict__.get("_br_restricted"):
+        return
+    TO._br_restricted = True
+    mods = set(mods)
+    module = sys.modules[TO.__module__]
+    orig = TO.check_file
+
+    def check_file(self, file, func, *a, **k):
+        real = module.load_sql_fixture_pairs
+
+        def filtered(name):
+            for meta, sql, expected in real(name):
+                d = meta.get("dialect")
+                if d and _dialect_hit(d, mods):
+                    yield meta, sql, expected
+
+        module.load_sql_fixture_pairs = filtered
+        try:
+            return orig(self, file, func, *a, **k)
+        finally:
+            module.load_sql_fixture_pairs = real
+
+    TO.check_file = check_file
 
 
 def _restrict_generator(spec):
