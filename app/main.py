@@ -168,7 +168,7 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
             groups.append(("gen_modules", mods, [i for i in want if i in GEN_IDS], 0.6))
     # Run a check only when dropping its tests would save more than it costs
     # (allowing for the ~15% of checks that fail and save nothing).
-    if opt and not others:
+    if opt and not others and OPT_CHECKS:
         mods = gen_modules(spans)
         if mods is not None and not any(m.rsplit(".", 1)[-1] == "duckdb" for m in mods):
             groups.append(("opt_modules", mods, opt, 1.2 + 0.3 * sum(ms[by_id[i]] for i in opt) / 1000))
@@ -176,6 +176,16 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     # another heavy test still sets the busiest worker.
     base = cost_of(chosen, ms)
     best, best_gain = (), 0.0
+    if not JOINT_GATING:
+        # Each check on its own, with the conservative estimates that scored
+        # 16.6 s of CPU on the practice board (TPC-DS at its pre-cache cost).
+        best = []
+        for g in groups:
+            est = (1.5 + 0.34 * (TPCDS_EXECUTED if g[1] is None else len(g[1]) + 1)) if g[0] == "tpcds" else g[3]
+            drop = {by_id[i] for i in g[2]}
+            if 0.85 * (base - cost_of([n for n in chosen if n not in drop], ms)) > est:
+                best.append(g)
+        groups = []
     for mask in range(1, 1 << len(groups)):
         combo = [g for k, g in enumerate(groups) if mask >> k & 1]
         drop = {by_id[i] for g in combo for i in g[2]}
@@ -208,6 +218,12 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
 
 
 SMALL_SUM_MS = 3000  # fully run candidate sets up to this many recorded seconds
+# Speculative checks, off by default: on the practice board they cost CPU
+# (16.6 s -> 48.8 s) without saving simulated seconds, i.e. there the tests
+# they check usually do fail. They pay on the labeled mutants and the sample.
+FULL_RUNS = os.environ.get("BR_FULL_RUNS", "0") == "1"
+OPT_CHECKS = os.environ.get("BR_OPT", "0") == "1"
+JOINT_GATING = os.environ.get("BR_JOINT", "0") == "1"
 
 
 def try_harmless(runner, patch_text, files, chosen, ms, ids, notes):
@@ -268,7 +284,7 @@ def main():
             chosen = refine(runner, patch, chosen, ms, ids, sel.log)
         if qmap is not None and chosen and time.time() - wall0 < WALL_BUDGET:
             chosen = check_heavy(runner, qmap, sel, patch.read_text(errors="replace"), chosen, ids, ms, sel.log)
-        if HEAVY and chosen and len(chosen) < len(every) and time.time() - wall0 < WALL_BUDGET:
+        if FULL_RUNS and HEAVY and chosen and len(chosen) < len(every) and time.time() - wall0 < WALL_BUDGET:
             text = patch.read_text(errors="replace")
             files = [ln[6:].strip() for ln in text.split("\n") if ln.startswith("+++ b/")]
             chosen = try_harmless(runner, text, files, chosen, ms, ids, sel.log)
