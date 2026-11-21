@@ -113,6 +113,11 @@ class Runner:
             self._restore(undo)
 
     def _fork(self, fn, timeout):
+        # The parent holds large maps and parsed syntax trees. Freezing them
+        # keeps the child's garbage collector from walking (and copying) them.
+        import gc
+
+        gc.freeze()
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # child
