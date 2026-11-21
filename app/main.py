@@ -112,14 +112,55 @@ def gen_modules(spans):
 
 
 TPCDS_EXECUTED = 57  # tpc-ds queries flagged for execution
-# Estimates deliberately err high: on the labeled mutants, cheaper estimates
-# traded CPU for simulated seconds one for one.
-CHECK_FIXED_CPU = 0.0
 
 
 def cost_of(numbers, ms):
     w = pack(sorted(numbers), ms)
     return (max(sum(ms[n] for n in x) for x in w) + WORKER_MS * len(w)) / 1000 if w else 0.0
+
+
+class Gate:
+    """Decides whether a check is worth its CPU, learning as the run goes.
+
+    Each kind of check has a pass rate, starting from a prior (pseudo-counts
+    from the labeled mutants and the sample) and updated with every result in
+    this run. A check runs when pass rate x seconds it would drop exceeds its
+    estimated CPU, and while total check CPU stays under a per-commit cap. On
+    a commit set where checked tests mostly do fail (as on the practice board)
+    the rates fall and checking stops paying for itself after a few tries.
+    """
+
+    PRIORS = {  # (passes, failures)
+        "gen_modules": (4.5, 0.5), "max_nodes": (4.5, 0.5),
+        "tpcds": (3.0, 1.0), "tpch": (3.0, 1.0),
+        "full": (2.0, 3.0), "opt_modules": (1.0, 3.0),
+    }
+    CPU_PER_COMMIT = float(os.environ.get("BR_CHECK_CPU_PER_COMMIT", "0.6"))
+
+    def __init__(self, n_commits):
+        self.stats = {k: list(v) for k, v in self.PRIORS.items()}
+        self.budget = self.CPU_PER_COMMIT * max(n_commits, 1)
+
+    def p(self, kind):
+        a, b = self.stats[kind]
+        return a / (a + b)
+
+    def record(self, kind, passed):
+        self.stats[kind][0 if passed else 1] += 1
+
+    @staticmethod
+    def used():
+        t = os.times()
+        return t.children_user + t.children_system
+
+    def affordable(self, est):
+        return self.used() + est <= self.budget
+
+    def summary(self):
+        return ", ".join(f"{k} {self.p(k):.2f}" for k in self.stats)
+
+
+GATE = None
 
 
 def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
@@ -138,7 +179,7 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     if MAX_NODES_ID in want and not any(r.startswith("tests/") for r, *_ in spans):
         base = cost_of(chosen, ms)
         rest = [n for n in chosen if ids[n] != MAX_NODES_ID]
-        if 0.85 * (base - cost_of(rest, ms)) > 1.0:
+        if GATE.p("max_nodes") * (base - cost_of(rest, ms)) > 0.4 and GATE.affordable(0.4):
             t = time.time()
             try:
                 res = runner.run_fn(patch_text, proxy_max_nodes, timeout=15)
@@ -146,6 +187,8 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
                 res = None
                 notes.append(f"max_nodes check error {e!r}")
             ok = res is not None and res.get(MAX_NODES_ID) == "passed"
+            if res is not None:
+                GATE.record("max_nodes", ok)
             notes.append(f"max_nodes check {'passed' if ok else 'failed'} in {time.time() - t:.1f}s")
             if ok:
                 chosen = rest
@@ -158,40 +201,35 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     if any(i in TPCDS_IDS for i in want):
         q = query_subset(qmap, "tpcds", spans)
         n = TPCDS_EXECUTED if q is None else len(q) + 1
-        groups.append(("tpcds", q, [i for i in want if i in TPCDS_IDS], 2.0 + 0.17 * n))
+        groups.append(("tpcds", q, [i for i in want if i in TPCDS_IDS], 1.0 + 0.16 * n))
     if any(i in TPCH_IDS for i in want):
         q = query_subset(qmap, "tpch", spans)
-        groups.append(("tpch", q, [i for i in want if i in TPCH_IDS], 2.5 if q is None else 1.5))
+        groups.append(("tpch", q, [i for i in want if i in TPCH_IDS], 1.5 if q is None else 1.0))
     if any(i in GEN_IDS for i in want):
         mods = gen_modules(spans) if not others else None
         if mods is not None:
             groups.append(("gen_modules", mods, [i for i in want if i in GEN_IDS], 0.6))
     # Run a check only when dropping its tests would save more than it costs
     # (allowing for the ~15% of checks that fail and save nothing).
-    if opt and not others and OPT_CHECKS:
+    if opt and not others:
         mods = gen_modules(spans)
         if mods is not None and not any(m.rsplit(".", 1)[-1] == "duckdb" for m in mods):
             groups.append(("opt_modules", mods, opt, 1.2 + 0.3 * sum(ms[by_id[i]] for i in opt) / 1000))
-    # Checks are judged together: dropping one heavy test rarely helps while
-    # another heavy test still sets the busiest worker.
+    # Checks are judged together (dropping one heavy test rarely helps while
+    # another still sets the busiest worker): expected gain of a combination
+    # is P(all its checks pass) x seconds dropped, minus their CPU.
     base = cost_of(chosen, ms)
     best, best_gain = (), 0.0
-    if not JOINT_GATING:
-        # Each check on its own, with the conservative estimates that scored
-        # 16.6 s of CPU on the practice board (TPC-DS at its pre-cache cost).
-        best = []
-        for g in groups:
-            est = (1.5 + 0.34 * (TPCDS_EXECUTED if g[1] is None else len(g[1]) + 1)) if g[0] == "tpcds" else g[3]
-            drop = {by_id[i] for i in g[2]}
-            if 0.85 * (base - cost_of([n for n in chosen if n not in drop], ms)) > est:
-                best.append(g)
-        groups = []
     for mask in range(1, 1 << len(groups)):
         combo = [g for k, g in enumerate(groups) if mask >> k & 1]
         drop = {by_id[i] for g in combo for i in g[2]}
         saving = base - cost_of([n for n in chosen if n not in drop], ms)
-        gain = 0.85 * saving - CHECK_FIXED_CPU - sum(g[3] for g in combo)
-        if gain > best_gain:
+        p_all = 1.0
+        for g in combo:
+            p_all *= GATE.p(g[0])
+        est = sum(g[3] for g in combo)
+        gain = p_all * saving - est
+        if gain > best_gain and GATE.affordable(est):
             best, best_gain = combo, gain
     spec = {key: val for key, val, _tids, _est in best}
     run = [i for g in best for i in g[2]]
@@ -212,18 +250,17 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
         notes.append("heavy check failed to run")
         return chosen
     passed = {i for i in run if res.get(i) == "passed"}
+    for key, _val, tids, _est in best:
+        if all(i in res for i in tids):  # every test reported (no early stop before it)
+            GATE.record(key, all(i in passed for i in tids))
     short = {k: (len(v) if isinstance(v, list) else v) for k, v in spec.items()}
     notes.append(f"heavy check {short} in {time.time() - t:.1f}s: dropped {len(passed)}/{len(run)}")
     return [n for n in chosen if ids[n] not in passed]
 
 
 SMALL_SUM_MS = 3000  # fully run candidate sets up to this many recorded seconds
-# Speculative checks, off by default: on the practice board they cost CPU
-# (16.6 s -> 48.8 s) without saving simulated seconds, i.e. there the tests
-# they check usually do fail. They pay on the labeled mutants and the sample.
-FULL_RUNS = os.environ.get("BR_FULL_RUNS", "0") == "1"
-OPT_CHECKS = os.environ.get("BR_OPT", "0") == "1"
-JOINT_GATING = os.environ.get("BR_JOINT", "0") == "1"
+# Small-set full runs and optimizer dialect checks are speculative: on the
+# practice board they mostly ran tests that do fail. Gate learns that.
 
 
 def try_harmless(runner, patch_text, files, chosen, ms, ids, notes):
@@ -237,6 +274,9 @@ def try_harmless(runner, patch_text, files, chosen, ms, ids, notes):
         return chosen
     if max(ms[n] for n in chosen) > RUN_MAX_MS or sum(ms[n] for n in chosen) > SMALL_SUM_MS:
         return chosen
+    est = sum(ms[n] for n in chosen) / 1000 + 0.7
+    if not (GATE.p("full") * cost_of(chosen, ms) > est and GATE.affordable(est)):
+        return chosen
     order = sorted(chosen, key=lambda n: ms[n])
     os.environ["BR_STOP_ON_FAIL"] = "1"
     t = time.time()
@@ -248,6 +288,8 @@ def try_harmless(runner, patch_text, files, chosen, ms, ids, notes):
     finally:
         os.environ.pop("BR_STOP_ON_FAIL", None)
     ok = res is not None and all(res.get(ids[n]) in ("passed", "skipped") for n in chosen)
+    if res is not None:
+        GATE.record("full", ok)
     notes.append(f"full run of {len(chosen)} {'passed' if ok else 'failed'} in {time.time() - t:.1f}s")
     return [] if ok else chosen
 
@@ -267,10 +309,13 @@ def main():
         with gzip.open(QMAP, "rt") as f:
             qmap = json.load(f)
     ids = {t["number"]: t["id"] for t in tests}
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    global GATE
+    GATE = Gate(len(patches))
     wall0 = time.time()
     log(f"loaded in {time.process_time() - t0:.2f}s cpu")
     total = 0
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    for patch in patches:
         cid = patch.stem
         try:
             chosen = sel.select(patch.read_text(errors="replace"))
@@ -284,7 +329,7 @@ def main():
             chosen = refine(runner, patch, chosen, ms, ids, sel.log)
         if qmap is not None and chosen and time.time() - wall0 < WALL_BUDGET:
             chosen = check_heavy(runner, qmap, sel, patch.read_text(errors="replace"), chosen, ids, ms, sel.log)
-        if FULL_RUNS and HEAVY and chosen and len(chosen) < len(every) and time.time() - wall0 < WALL_BUDGET:
+        if HEAVY and chosen and len(chosen) < len(every) and time.time() - wall0 < WALL_BUDGET:
             text = patch.read_text(errors="replace")
             files = [ln[6:].strip() for ln in text.split("\n") if ln.startswith("+++ b/")]
             chosen = try_harmless(runner, text, files, chosen, ms, ids, sel.log)
@@ -293,6 +338,7 @@ def main():
         total += cost
         log(f"{cid}: {len(chosen)} tests, {len(workers)} workers, {cost / 1000:.1f}s; {'; '.join(sel.log)[:200]}")
         print(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")), flush=True)
+    log(f"check pass rates: {GATE.summary()}; check cpu {GATE.used():.1f}s of {GATE.budget:.1f}s")
     tm = os.times()
     log(f"predicted simulated {total / 1000:.1f}s, cpu self {tm.user + tm.system:.2f}s"
         f" children {tm.children_user + tm.children_system:.2f}s, wall {time.time() - wall0:.1f}s")
