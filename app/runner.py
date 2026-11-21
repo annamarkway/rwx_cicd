@@ -114,6 +114,14 @@ class Runner:
         if pid == 0:  # child
             os.close(r)
             code = 0
+
+            def emit(res, _w=w):
+                os.write(_w, json.dumps(res).encode())
+                os.close(_w)
+                os._exit(0)
+
+            global _EMIT
+            _EMIT = emit
             try:
                 res = _child(nodeids)
                 os.write(w, json.dumps(res).encode())
@@ -158,6 +166,9 @@ class Runner:
         return res
 
 
+_EMIT = None  # in the child: send results to the parent and exit at once
+
+
 def _child(nodeids):
     os.chdir(WORK)
     sys.path.insert(0, str(WORK))
@@ -174,6 +185,10 @@ def _child(nodeids):
         def pytest_runtest_logreport(self, report):
             if report.failed:
                 results[report.nodeid] = "failed"
+                if os.environ.get("BR_STOP_ON_FAIL") == "1":
+                    # The caller keeps every test that did not report "passed",
+                    # so the rest of the run cannot change its answer.
+                    _EMIT(results)
             elif report.when == "call" and report.nodeid not in results:
                 results[report.nodeid] = "passed" if report.outcome == "passed" else report.outcome
             elif report.skipped and report.nodeid not in results:
@@ -182,6 +197,16 @@ def _child(nodeids):
         def pytest_collectreport(self, report):
             if report.failed:
                 results["__collect_failed__:" + report.nodeid] = "failed"
+
+        def pytest_pycollect_makeitem(self, collector, name, obj):
+            # pytest reads setUpClass while collecting a unittest class, so
+            # the executor tests must be restricted before that happens.
+            if name == "TestExecutor" and isinstance(obj, type):
+                _restrict_executor(obj, json.loads(os.environ.get("BR_SUBSET") or "{}"))
+            return None
+
+        def pytest_collection_finish(self, session):
+            _restrict_generator(json.loads(os.environ.get("BR_SUBSET") or "{}"))
 
     args = [
         "-q", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
@@ -200,6 +225,68 @@ def _child(nodeids):
     return results
 
 
+def _restrict(spec):
+    """Run only part of the heavy loop-over-cases tests, using their own code.
+
+    spec["tpch"] / spec["tpcds"]: query indices to keep (None = all). Queries
+      whose text the patch changed are always kept; if the patch changed how
+      many queries a fixture holds, all are kept.
+    spec["gen_modules"]: keep only the dialects whose generator's class
+      hierarchy lives in one of these modules (None = all).
+    """
+    _restrict_generator(spec)
+
+
+def _restrict_executor(TE, spec):
+    if TE.__dict__.get("_br_restricted") or not ("tpch" in spec or "tpcds" in spec):
+        return
+    if True:
+        import tests.helpers as helpers
+
+        TE._br_restricted = True
+        orig = TE.setUpClass.__func__
+        src = os.environ.get("BR_SRC_FIXTURES")
+
+        def setUpClass(cls):
+            orig(cls)
+            for kind, attr, fname in (("tpch", "tpch_sqls", "optimizer/tpc-h/tpc-h.sql"),
+                                      ("tpcds", "tpcds_sqls", "optimizer/tpc-ds/tpc-ds.sql")):
+                keep = spec.get(kind)
+                if keep is None:
+                    continue
+                new = getattr(cls, attr)
+                saved = helpers.FIXTURES_DIR
+                try:
+                    helpers.FIXTURES_DIR = src
+                    old = list(helpers.load_sql_fixture_pairs(fname))
+                finally:
+                    helpers.FIXTURES_DIR = saved
+                if len(old) != len(new):
+                    continue  # the fixture's shape changed: run every query
+                idx = set(keep) | {i for i, (a, b) in enumerate(zip(old, new)) if a != b}
+                setattr(cls, attr, [new[i] for i in sorted(idx) if i < len(new)])
+
+        TE.setUpClass = classmethod(setUpClass)
+
+
+def _restrict_generator(spec):
+    tg = sys.modules.get("tests.test_generator")
+    mods = spec.get("gen_modules")
+    if tg is not None and mods is not None:
+        mods = set(mods)
+        keep = []
+        for name in tg.Dialects:
+            try:
+                d = tg.Dialect.get_or_raise(name)
+                hier = {k.__module__ for k in type(d).__mro__} | {k.__module__ for k in d.generator_class.__mro__}
+            except Exception:  # noqa: BLE001
+                keep.append(name)  # cannot tell: keep it
+                continue
+            if hier & mods:
+                keep.append(name)
+        tg.Dialects = keep
+
+
 def _install_inline_executor():
     """Replace ProcessPoolExecutor with an in-process one that still pickles.
 
@@ -211,12 +298,41 @@ def _install_inline_executor():
     import concurrent.futures.process as cfp
     import pickle
 
+    class LazyFuture(cf.Future):
+        """Runs its work when result() is first asked for."""
+
+        def __init__(self, work):
+            super().__init__()
+            self._work = work
+
+        def result(self, timeout=None):
+            if self._work is not None:
+                work, self._work = self._work, None
+                try:
+                    self.set_result(work())
+                except BaseException as e:  # noqa: BLE001
+                    self.set_exception(e)
+            return super().result(timeout)
+
     class InlineExecutor:
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
+            # The executor tests (the ones with an initializer) read futures
+            # one by one with result(), so their work can run lazily and a
+            # failing query can stop the run early. The optimizer tests use
+            # wait()/as_completed(), which need finished futures.
+            self.lazy = initializer is not None
             if initializer is not None:
                 initializer(*pickle.loads(pickle.dumps(initargs)))
 
         def submit(self, fn, *args, **kwargs):
+            if self.lazy:
+                payload = pickle.dumps((fn, args, kwargs))
+
+                def work():
+                    fn2, a, kw = pickle.loads(payload)
+                    return pickle.loads(pickle.dumps(fn2(*a, **kw)))
+
+                return LazyFuture(work)
             fut = cf.Future()
             try:
                 fn2, a, kw = pickle.loads(pickle.dumps((fn, args, kwargs)))

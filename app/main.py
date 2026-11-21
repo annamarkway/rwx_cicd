@@ -23,6 +23,16 @@ MAX_WORKERS = 8
 RUN_MAX_MS = int(os.environ.get("BR_RUN_MAX_MS", "1500"))  # run tests up to this long; print longer ones
 RUN = os.environ.get("BR_RUN", "0") == "1"
 WALL_BUDGET = float(os.environ.get("BR_WALL", "150"))  # stop running tests after this many seconds
+HEAVY = os.environ.get("BR_HEAVY", "1") == "1"  # check heavy loop-over-cases tests in-container
+QMAP = Path(os.environ.get("BR_QMAP", HERE / "querymap.json.gz"))
+
+# Heavy tests we can check cheaply by running only the cases a change reaches.
+TPCDS_IDS = {"tests/test_executor.py::TestExecutor::test_execute_tpcds"}
+TPCH_IDS = {"tests/test_executor.py::TestExecutor::test_execute_tpch",
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch"}
+GEN_IDS = {"tests/test_generator.py::TestGenerator::test_generator_memory"}
+DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/",
+                "sqlglot/tokenizers/", "sqlglot/typing/")
 
 
 def log(*a):
@@ -71,6 +81,98 @@ def refine(runner, patch, chosen, ms, ids, notes):
     return sorted(set(failed) | set(keep))
 
 
+def query_subset(qmap, kind, spans):
+    """Query indices a change can reach, or None for "all of them"."""
+    idx = set()
+    for rel, a, b, in_func in spans:
+        if rel.startswith("tests/") or not in_func:
+            return None
+        common = qmap["common"].get(rel, ())
+        cov = qmap[kind].get(rel, {})
+        for ln in range(a, b + 1):
+            if ln in common:
+                return None
+            idx.update(cov.get(str(ln), ()))
+    return sorted(idx)
+
+
+def gen_modules(spans):
+    """Modules whose dialects test_generator_memory must check, or None for all."""
+    mods = set()
+    for rel, _a, _b, _f in spans:
+        name = os.path.basename(rel)[:-3]
+        if not rel.startswith(DIALECT_DIRS) or name in ("__init__", "dialect") or rel.count("/") != 2:
+            return None
+        mods.add(rel[:-3].replace("/", "."))
+        mods.add(f"sqlglot.dialects.{name}")
+    return sorted(mods)
+
+
+TPCDS_EXECUTED = 57  # tpc-ds queries flagged for execution
+
+
+def cost_of(numbers, ms):
+    w = pack(sorted(numbers), ms)
+    return (max(sum(ms[n] for n in x) for x in w) + WORKER_MS * len(w)) / 1000 if w else 0.0
+
+
+def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
+    """Run cheap partial versions of the heavy tests in chosen; drop those that pass."""
+    by_id = {ids[n]: n for n in chosen}
+    want = [i for i in by_id if i in TPCDS_IDS | TPCH_IDS | GEN_IDS]
+    if not want:
+        return chosen
+    found = sel.changed_spans(patch_text)
+    if found is None:
+        return chosen
+    spans, others = found
+    if any(not o.startswith("tests/fixtures/") for o in others):
+        return chosen
+    # Candidate checks: (spec key, spec value, test ids, estimated CPU seconds).
+    groups = []
+    if any(i in TPCDS_IDS for i in want):
+        q = query_subset(qmap, "tpcds", spans)
+        n = TPCDS_EXECUTED if q is None else len(q) + 1
+        groups.append(("tpcds", q, [i for i in want if i in TPCDS_IDS], 1.5 + 0.34 * n))
+    if any(i in TPCH_IDS for i in want):
+        q = query_subset(qmap, "tpch", spans)
+        groups.append(("tpch", q, [i for i in want if i in TPCH_IDS], 2.5 if q is None else 1.5))
+    if any(i in GEN_IDS for i in want):
+        mods = gen_modules(spans) if not others else None
+        if mods is not None:
+            groups.append(("gen_modules", mods, [i for i in want if i in GEN_IDS], 0.6))
+    # Run a check only when dropping its tests would save more than it costs
+    # (allowing for the ~15% of checks that fail and save nothing).
+    base = cost_of(chosen, ms)
+    spec, run = {}, []
+    for key, val, tids, est in groups:
+        drop = {by_id[i] for i in tids}
+        saving = base - cost_of([n for n in chosen if n not in drop], ms)
+        if 0.85 * saving > est:
+            spec[key] = val
+            run += tids
+    if not run:
+        return chosen
+    os.environ["BR_SUBSET"] = json.dumps(spec)
+    os.environ["BR_STOP_ON_FAIL"] = "1"
+    t = time.time()
+    try:
+        res = runner.run(patch_text, run, timeout=90)
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"heavy check error {e!r}")
+        return chosen
+    finally:
+        os.environ.pop("BR_SUBSET", None)
+        os.environ.pop("BR_STOP_ON_FAIL", None)
+    if res is None:
+        notes.append("heavy check failed to run")
+        return chosen
+    passed = {i for i in run if res.get(i) == "passed"}
+    short = {k: (len(v) if isinstance(v, list) else v) for k, v in spec.items()}
+    notes.append(f"heavy check {short} in {time.time() - t:.1f}s: dropped {len(passed)}/{len(run)}")
+    return [n for n in chosen if ids[n] not in passed]
+
+
 def main():
     t0 = time.process_time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
@@ -80,6 +182,11 @@ def main():
         mapdata = json.load(f)
     sel = Selector(SRC, mapdata, tests)
     runner = Runner(SRC)
+    os.environ["BR_SRC_FIXTURES"] = str(SRC / "tests" / "fixtures")
+    qmap = None
+    if HEAVY and QMAP.exists():
+        with gzip.open(QMAP, "rt") as f:
+            qmap = json.load(f)
     ids = {t["number"]: t["id"] for t in tests}
     wall0 = time.time()
     log(f"loaded in {time.process_time() - t0:.2f}s cpu")
@@ -96,6 +203,8 @@ def main():
         chosen = sorted(set(chosen) & every)
         if RUN and chosen and len(chosen) < len(every) and time.time() - wall0 < WALL_BUDGET:
             chosen = refine(runner, patch, chosen, ms, ids, sel.log)
+        if qmap is not None and chosen and time.time() - wall0 < WALL_BUDGET:
+            chosen = check_heavy(runner, qmap, sel, patch.read_text(errors="replace"), chosen, ids, ms, sel.log)
         workers = pack(chosen, ms)
         cost = (max(sum(ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost

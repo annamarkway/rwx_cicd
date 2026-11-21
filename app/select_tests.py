@@ -495,6 +495,42 @@ class Selector:
             raise Fallback(f"config {path}")
         return set()
 
+    def changed_spans(self, patch_text: str):
+        """Where a patch changes behaviour, for the heavy-test checks.
+
+        Returns (spans, other_files): spans are (relpath, first, last, in_func)
+        for the innermost statement around each changed line of every .py
+        file whose AST really changed; other_files are non-.py paths. Returns
+        None when the patch cannot be read this way.
+        """
+        try:
+            spans, others = [], []
+            for fd in parse_patch(patch_text):
+                if fd.binary or fd.old is None or fd.new is None or fd.old != fd.new:
+                    return None
+                path = fd.new
+                if not path.endswith(".py"):
+                    others.append(path)
+                    continue
+                old = self.text(path)
+                if old is None:
+                    return None
+                new_tree = ast.parse(apply(old, fd))
+                if equivalent(self.tree(path), new_tree):
+                    continue
+                for ln in sorted(set(changed_points(fd))):
+                    if ln < 1:
+                        continue
+                    chain = locate(self.tree(path), ln)
+                    if not chain:
+                        continue
+                    inner = chain[-1]
+                    in_func = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in chain)
+                    spans.append((path, _start(inner), inner.end_lineno or inner.lineno, in_func))
+            return spans, others
+        except (Fallback, SyntaxError, RecursionError):
+            return None
+
     def select(self, patch_text: str) -> set[int] | str:
         self.log = []
         try:
