@@ -241,13 +241,41 @@ def _restrict(spec):
     _restrict_generator(spec)
 
 
+DUCK_CACHE = os.environ.get("BR_DUCK_CACHE", "/opt/cache/duck.pkl")
+
+
+def _use_duck_cache(TE):
+    """Reuse DuckDB's pinned-commit answer when the patched transpile is identical."""
+    te = sys.modules[TE.__module__]
+    try:
+        import pickle
+
+        with open(DUCK_CACHE, "rb") as f:
+            duck = pickle.load(f)
+    except Exception:  # noqa: BLE001
+        return
+    orig = TE.cached_execute
+
+    def cached_execute(self, sql, tpch=True):
+        if sql not in self.cache:
+            hit = duck.get((tpch, sql))
+            if hit is not None and te.transpile(sql, write="duckdb")[0] == hit[0]:
+                self.cache[sql] = hit[1].copy()
+        return orig(self, sql, tpch=tpch)
+
+    TE.cached_execute = cached_execute
+
+
 def _restrict_executor(TE, spec):
-    if TE.__dict__.get("_br_restricted") or not ("tpch" in spec or "tpcds" in spec):
+    if TE.__dict__.get("_br_restricted"):
+        return
+    TE._br_restricted = True
+    _use_duck_cache(TE)
+    if not ("tpch" in spec or "tpcds" in spec):
         return
     if True:
         import tests.helpers as helpers
 
-        TE._br_restricted = True
         orig = TE.setUpClass.__func__
         src = os.environ.get("BR_SRC_FIXTURES")
 

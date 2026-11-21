@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir -r /tmp/requirements.lock && rm /tmp/requirements
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests || true
 
 COPY app /app
-RUN chmod -R a+rX /app /opt/sqlglot
+# DuckDB's expected TPC results at the pinned commit (see app/precompute.py).
+RUN mkdir -p /opt/cache && SKIP_INTEGRATION=0 python /app/precompute.py /opt/sqlglot /opt/cache/duck.pkl
+RUN chmod -R a+rX /app /opt/sqlglot /opt/cache
 ENV PYTHONDONTWRITEBYTECODE=1 BR_SRC=/opt/sqlglot
 CMD ["python", "/app/main.py"]

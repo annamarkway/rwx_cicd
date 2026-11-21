@@ -109,6 +109,9 @@ def gen_modules(spans):
 
 
 TPCDS_EXECUTED = 57  # tpc-ds queries flagged for execution
+# Estimates deliberately err high: on the labeled mutants, cheaper estimates
+# traded CPU for simulated seconds one for one.
+CHECK_FIXED_CPU = 0.0
 
 
 def cost_of(numbers, ms):
@@ -151,7 +154,7 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
     if any(i in TPCDS_IDS for i in want):
         q = query_subset(qmap, "tpcds", spans)
         n = TPCDS_EXECUTED if q is None else len(q) + 1
-        groups.append(("tpcds", q, [i for i in want if i in TPCDS_IDS], 1.5 + 0.34 * n))
+        groups.append(("tpcds", q, [i for i in want if i in TPCDS_IDS], 2.0 + 0.17 * n))
     if any(i in TPCH_IDS for i in want):
         q = query_subset(qmap, "tpch", spans)
         groups.append(("tpch", q, [i for i in want if i in TPCH_IDS], 2.5 if q is None else 1.5))
@@ -161,14 +164,19 @@ def check_heavy(runner, qmap, sel, patch_text, chosen, ids, ms, notes):
             groups.append(("gen_modules", mods, [i for i in want if i in GEN_IDS], 0.6))
     # Run a check only when dropping its tests would save more than it costs
     # (allowing for the ~15% of checks that fail and save nothing).
+    # Checks are judged together: dropping one heavy test rarely helps while
+    # another heavy test still sets the busiest worker.
     base = cost_of(chosen, ms)
-    spec, run = {}, []
-    for key, val, tids, est in groups:
-        drop = {by_id[i] for i in tids}
+    best, best_gain = (), 0.0
+    for mask in range(1, 1 << len(groups)):
+        combo = [g for k, g in enumerate(groups) if mask >> k & 1]
+        drop = {by_id[i] for g in combo for i in g[2]}
         saving = base - cost_of([n for n in chosen if n not in drop], ms)
-        if 0.85 * saving > est:
-            spec[key] = val
-            run += tids
+        gain = 0.85 * saving - CHECK_FIXED_CPU - sum(g[3] for g in combo)
+        if gain > best_gain:
+            best, best_gain = combo, gain
+    spec = {key: val for key, val, _tids, _est in best}
+    run = [i for g in best for i in g[2]]
     if not run:
         return chosen
     os.environ["BR_SUBSET"] = json.dumps(spec)
