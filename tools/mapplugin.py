@@ -15,14 +15,16 @@ _SRC = "/src/"
 
 
 def _hook(event, args):
-    if event == "open" and _current is not None:
+    if event == "open":
         path = args[0]
         if isinstance(path, bytes):
             path = path.decode(errors="replace")
         if isinstance(path, str):
             path = os.path.abspath(path)
             if path.startswith(_SRC) and not path.endswith((".pyc", ".py")):
-                _opens.setdefault(_current, set()).add(path[len(_SRC):])
+                # Opens outside any test (collection, module-level fixture
+                # loads) are kept under "__collect__".
+                _opens.setdefault(_current or "__collect__", set()).add(path[len(_SRC):])
 
 
 sys.addaudithook(_hook)
@@ -142,10 +144,15 @@ def _flush_types(nodeid):
         _classes[nodeid] = sorted(names)
 
 
+COV = None  # set by tools/isomap.py: switch coverage context per phase
+
+
 def pytest_runtest_setup(item):
     global _current
     _current = item.nodeid
     _types_seen.clear()
+    if COV is not None:
+        COV.switch_context("B")
 
 
 def pytest_runtest_teardown(item):

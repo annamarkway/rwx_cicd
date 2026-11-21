@@ -280,6 +280,7 @@ class Selector:
         self.lines = mapdata["lines"]
         self.opens = mapdata["opens"]
         self.classes = mapdata["classes"]
+        self.imports = mapdata.get("imports", {})
         self.tests = tests
         self.by_file: dict[str, set[int]] = {}
         for t in tests:
@@ -328,6 +329,22 @@ class Selector:
                 out.update(v)
         return out
 
+    def import_cov(self, rel: str, node) -> set[int]:
+        """Tests in files whose import (collection) ran any line of node.
+
+        A broken function that runs at import time breaks every test in the
+        importing test file, e.g. a lazy module __getattr__ used by a
+        module-level `from sqlglot.optimizer import x`.
+        """
+        fl = self.imports.get(rel)
+        out: set[int] = set()
+        if not fl:
+            return out
+        for ln in range(_start(node), (node.end_lineno or node.lineno) + 1):
+            for f in fl.get(str(ln), ()):
+                out |= self.by_file.get(f, set())
+        return out
+
     def cov_node(self, rel: str, node) -> set[int]:
         return self.cov(rel, _start(node), node.end_lineno or node.lineno)
 
@@ -350,7 +367,7 @@ class Selector:
         sel = self.cov_node(rel, inner)
         in_func = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in chain)
         if in_func:
-            return sel
+            return sel | self.import_cov(rel, inner)
         classes = [n for n in chain if isinstance(n, ast.ClassDef)]
         if classes:
             users = self.class_users(rel, chain)
